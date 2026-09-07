@@ -5,6 +5,7 @@ import argparse
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -79,7 +80,7 @@ def load_config(path: Path) -> list[BackupItem]:
     return backups
 
 
-def create_backup(name: str, source: Path, destination: Path) -> Path:
+def create_backup(name: str, source: Path, destination: Path, lock_descriptor: int) -> Path:
     try:
         source = source.resolve(strict=True)
         if not source.is_dir():
@@ -105,6 +106,8 @@ def create_backup(name: str, source: Path, destination: Path) -> Path:
             ["/usr/bin/zip", "-q", "-r", "-y", "-MM", str(temporary_archive), "./" + source.name],
             cwd=source.parent,
             env=environment,
+            # zip 与 Python 共享同一把锁，父进程被终止也不能提前放行。
+            pass_fds=(lock_descriptor,),
             capture_output=True,
             text=True,
             errors="replace",
@@ -237,7 +240,42 @@ def validate_source_contents(source: Path) -> None:
                     raise BackupError(f"不支持的文件系统对象：{entry.path}")
 
 
+def acquire_run_lock() -> int:
+    # 使用本机共享位置，不受配置、当前目录、HOME 或 TMPDIR 影响。
+    # 只读文件即可 flock；所有用户可读，严格的调用方 umask 也不会隔离此锁。
+    previous_umask = os.umask(0)
+    try:
+        descriptor = os.open(
+            "/private/tmp/phychel-backup-service.lock",
+            os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o444,
+        )
+    finally:
+        os.umask(previous_umask)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BackupError("运行锁路径不是普通文件")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    # 不删除锁文件，也不显式 LOCK_UN：由进程退出关闭最后的描述符时释放。
+    return descriptor
+
+
 def main() -> int:
+    try:
+        lock_descriptor = acquire_run_lock()
+    except BlockingIOError:
+        print("备份正在运行", file=sys.stderr, flush=True)
+        return 1
+    except (BackupError, OSError) as error:
+        print(f"无法取得运行锁：{error}", file=sys.stderr, flush=True)
+        return 1
+    return run_command(lock_descriptor)
+
+
+def run_command(lock_descriptor: int) -> int:
     parser = argparse.ArgumentParser(description="按配置顺序将多个源目录分别备份为新的 ZIP 备份包。")
     parser.add_argument("--config", required=True, type=Path, help="JSON 配置文件路径")
     args = parser.parse_args()
@@ -259,7 +297,7 @@ def main() -> int:
                 raise BackupError("运行环境需要 macOS 和 Python 3")
             if not Path("/usr/bin/zip").is_file() or not os.access("/usr/bin/zip", os.X_OK):
                 raise BackupError("系统 zip 不可用：需要可执行的 macOS /usr/bin/zip")
-            archive = create_backup(item.name, item.source, item.destination)
+            archive = create_backup(item.name, item.source, item.destination, lock_descriptor)
         except (BackupError, OSError, ValueError) as error:
             result = f"[{item.name}] 备份失败：{error}"
             print(result, file=sys.stderr, flush=True)

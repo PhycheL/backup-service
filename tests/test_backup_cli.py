@@ -1,17 +1,22 @@
 """通过真实命令行和 macOS 解压工具验收备份行为。"""
 
+from contextlib import closing
+import errno
 import json
 import os
 from pathlib import Path
 import resource
 import re
+import select
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
-from typing import Callable, Optional
+from typing import Callable, Optional, TextIO
 
 
 ENTRY_POINT = Path(__file__).resolve().parents[1] / "backup.py"
@@ -80,6 +85,201 @@ class BackupCLITests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.write_config({"backups": [self.item]})
         return {path: path.read_bytes() for path in self.destination.iterdir()}
+
+    def start_backup(self, config: Path, *, stderr: Optional[TextIO] = None) -> subprocess.Popen[str]:
+        environment = os.environ.copy()
+        environment.update(HOME=str(self.root), TMPDIR=str(self.source))
+        process = subprocess.Popen(
+            [sys.executable, str(ENTRY_POINT), "--config", str(config)],
+            cwd=self.source,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if stderr is None else stderr,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+
+        def stop_processes() -> None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=10)
+
+        self.addCleanup(stop_processes)
+        return process
+
+    def open_config_writer(self, process: subprocess.Popen[str], fifo: Path) -> int:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            self.assertIsNone(process.poll(), "首个实例在读取配置前退出")
+            try:
+                # 写端成功打开表明真实 CLI 已打开读端，随后保持无 EOF 状态。
+                return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                os.sched_yield()
+        self.fail("首个实例未打开配置管道")
+
+    def test_overlapping_configurations_are_rejected_without_backup_or_cleanup(self) -> None:
+        previous = self.create_excess_history()
+        original_config = self.config.read_text(encoding="utf-8")
+        fifo = self.root / "first-config.fifo"
+        os.mkfifo(fifo)
+        first = self.start_backup(fifo)
+        with os.fdopen(self.open_config_writer(first, fifo), "w") as writer:
+            second = self.run_backup()
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertIn("备份正在运行", second.stderr)
+            self.assertNotIn("开始备份", second.stdout)
+            self.assertEqual({path: path.read_bytes() for path in self.destination.iterdir()}, previous)
+            self.assertIsNone(first.poll())
+            unrelated_destination = self.root / "unrelated-backups"
+            self.write_config({"backups": [{**self.item, "destination": str(unrelated_destination)}]})
+            second = self.run_backup()
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertIn("备份正在运行", second.stderr)
+            self.assertFalse(unrelated_destination.exists())
+            self.config.write_text("{broken", encoding="utf-8")
+            second = self.run_backup()
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertIn("备份正在运行", second.stderr)
+            self.assertNotIn("配置", second.stderr)
+            self.config.write_text(original_config, encoding="utf-8")
+            writer.write(original_config)
+
+        stdout, stderr = first.communicate(timeout=20)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertIn("汇总：全部成功", stdout)
+        self.assertEqual(len(list(self.destination.iterdir())), 1)
+        again = self.run_backup()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_configuration_error_and_termination_allow_restart_without_manual_cleanup(self) -> None:
+        for termination in [None, signal.SIGTERM, signal.SIGKILL]:
+            with self.subTest(termination=termination):
+                fifo = self.root / f"config-{termination}.fifo"
+                os.mkfifo(fifo)
+                first = self.start_backup(fifo)
+                with os.fdopen(self.open_config_writer(first, fifo), "w") as writer:
+                    second = self.run_backup()
+                    self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+                    self.assertIn("备份正在运行", second.stderr)
+                    if termination is None:
+                        writer.write("{broken")
+                    else:
+                        first.send_signal(termination)
+                stdout, stderr = first.communicate(timeout=10)
+                if termination is None:
+                    self.assertEqual(first.returncode, 1, stdout + stderr)
+                    self.assertIn("配置", stderr)
+                else:
+                    self.assertEqual(first.returncode, -termination)
+                again = self.run_backup()
+                self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_exclusion_covers_summary_after_all_items_and_cleanup(self) -> None:
+        previous = self.create_excess_history()
+        other_source = self.root / "other-source"
+        other_source.mkdir()
+        (other_source / "content.txt").write_text("other content", encoding="utf-8")
+        config = self.root / "summary-config.json"
+        config.write_text(json.dumps({"backups": [
+            self.item,
+            {**self.item, "name": "other", "source": str(other_source)},
+            # 超长无效路径的错误结果使汇总超过管道容量，未读完时进程不能退出。
+            {**self.item, "name": "invalid", "source": "/" + "x" * (256 * 1024)},
+        ]}), encoding="utf-8")
+        with (self.root / "errors.txt").open("w") as errors:
+            first = self.start_backup(config, stderr=errors)
+            assert first.stdout is not None
+            deadline = time.monotonic() + 20
+            output = b""
+            while "\n汇总：".encode() not in output:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, "未观察到最终汇总")
+                self.assertTrue(select.select([first.stdout], [], [], remaining)[0], "未观察到最终汇总")
+                chunk = os.read(first.stdout.fileno(), 65536)
+                self.assertTrue(chunk, "首个实例在汇总前退出")
+                output += chunk
+            first.send_signal(signal.SIGSTOP)
+            _, status = os.waitpid(first.pid, os.WUNTRACED)
+            self.assertTrue(os.WIFSTOPPED(status))
+            archives = {path: path.read_bytes() for path in self.destination.iterdir()}
+            self.assertEqual(len(archives), 2)
+            self.assertFalse(previous.keys() & archives.keys())
+            second = self.run_backup()
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+            self.assertIn("备份正在运行", second.stderr)
+            self.assertEqual({path: path.read_bytes() for path in self.destination.iterdir()}, archives)
+            first.send_signal(signal.SIGCONT)
+            first.communicate(timeout=20)
+            self.assertEqual(first.returncode, 1)
+        again = self.run_backup()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def stop_zip_child(self, process: subprocess.Popen[str]) -> int:
+        deadline = time.monotonic() + 10
+        child = None
+        while time.monotonic() < deadline:
+            self.assertIsNone(process.poll(), "首个实例在暂停 zip 前退出")
+            listing = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid=,stat=,comm="],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            for line in listing.stdout.splitlines():
+                fields = line.split(None, 3)
+                if len(fields) != 4:
+                    continue
+                pid, parent, status, command = fields
+                if int(parent) != process.pid or command != "/usr/bin/zip":
+                    continue
+                if child is None:
+                    child = int(pid)
+                    os.kill(child, signal.SIGSTOP)
+                elif int(pid) == child and "T" in status:
+                    return child
+        self.fail("未观察到已暂停的真实 zip 子进程")
+
+    def test_orphaned_zip_holds_exclusion_until_it_exits(self) -> None:
+        large_source = self.root / "large-source"
+        large_source.mkdir()
+        # 留出外部进程控制的机会；正确性取决于 ps 确认的停止状态，而非等待时长。
+        with (large_source / "large.bin").open("wb") as payload:
+            payload.truncate(256 * 1024 * 1024)
+        config = self.root / "large-config.json"
+        config.write_text(json.dumps({"backups": [{
+            **self.item, "source": str(large_source),
+            "destination": str(self.root / "first-backups"),
+        }]}), encoding="utf-8")
+        for termination, child_signal in [(signal.SIGKILL, signal.SIGCONT), (signal.SIGTERM, signal.SIGKILL)]:
+            with self.subTest(termination=termination, child_signal=child_signal):
+                previous = {path: path.read_bytes() for path in self.destination.glob("*")}
+                first = self.start_backup(config)
+                child = self.stop_zip_child(first)
+                with closing(select.kqueue()) as events:
+                    events.control([select.kevent(
+                        child, filter=select.KQ_FILTER_PROC,
+                        flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                        fflags=select.KQ_NOTE_EXIT,
+                    )], 0, 0)
+                    second = self.run_backup()
+                    self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+                    self.assertIn("备份正在运行", second.stderr)
+                    first.send_signal(termination)
+                    self.assertEqual(first.wait(timeout=10), -termination)
+
+                    second = self.run_backup()
+                    self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+                    self.assertIn("备份正在运行", second.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in self.destination.glob("*")}, previous)
+
+                    os.kill(child, child_signal)
+                    self.assertTrue(events.control(None, 1, 20), "zip 未结束")
+                again = self.run_backup()
+                self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
 
     def test_complete_directory_can_be_restored(self) -> None:
         (self.source / "多层" / "子目录").mkdir(parents=True)
