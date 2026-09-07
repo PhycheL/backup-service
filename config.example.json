@@ -5,6 +5,12 @@
       "source": "/Users/backup/Documents",
       "destination": "/Volumes/Backup/archives",
       "keep": 10
+    },
+    {
+      "name": "projects",
+      "source": "/Users/backup/Projects",
+      "destination": "/Volumes/Backup/archives",
+      "keep": 5
     }
   ]
 }

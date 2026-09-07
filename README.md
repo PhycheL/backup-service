@@ -1,8 +1,8 @@
 # 文件夹备份
 
-在 macOS 上一次运行，将一个完整源目录保存为新的 ZIP 备份包，然后退出。Python 负责配置和流程，系统 `/usr/bin/zip` 负责整体归档，无需第三方 Python 包。
+在 macOS 上一次运行，按配置顺序将多个完整源目录分别保存为新的 ZIP 备份包，汇总结果后退出。Python 负责配置和流程，系统 `/usr/bin/zip` 负责整体归档，无需第三方 Python 包。
 
-当前交付 [Issue #2](https://github.com/PhycheL/backup-service/issues/2)：只接受一个备份项；`keep` 会校验，但尚不清理历史备份。多项执行、历史保留和单实例互斥由后续任务实现。
+当前已交付单项归档和 [Issue #3：多备份项顺序执行与失败汇总](https://github.com/PhycheL/backup-service/issues/3)。单项失败后继续处理后续项；`keep` 会校验，但尚不清理历史备份。历史保留和单实例互斥由后续任务实现。
 
 ## 运行前提
 
@@ -39,15 +39,21 @@ cp config.example.json config.json
       "source": "/Users/backup/Documents",
       "destination": "/Volumes/Backup/archives",
       "keep": 10
+    },
+    {
+      "name": "projects",
+      "source": "/Users/backup/Projects",
+      "destination": "/Volumes/Backup/archives",
+      "keep": 5
     }
   ]
 }
 ```
 
-- `backups`：必须是仅有一个备份项的列表；多项配置会直接报错，不会执行第一项后报告全部成功。
-- `name`：稳定的备份项名称，可含中文、空格和连字符。长度为 1–100 个 UTF-8 字节，不能含 `/`、`\`、控制字符或首尾空白，也不能是 `.`、`..`。改变名称视为新的备份项归属。
+- `backups`：至少包含一个备份项的有序列表。严格按列表顺序执行，一项结束后才开始下一项，不同时压缩多项。
+- `name`：在整份配置中唯一且稳定的备份项名称，可含中文、空格和连字符。长度为 1–100 个 UTF-8 字节，不能含 `/`、`\`、控制字符或首尾空白，也不能是 `.`、`..`。改变名称视为新的备份项归属。
 - `source`：源目录，必须存在。若配置路径通过符号链接指向目录，会备份实际目录，包内顶层名称采用解析后的源目录名称；源目录内部的符号链接仍保存链接本身。
-- `destination`：备份目录，不存在时自动创建。不能等于源目录或位于其内部；符号链接、大小写等路径别名按实际目录关系检查。
+- `destination`：备份目录，不存在时自动创建，多项可共用。不能等于任一已配置源目录或位于其内部；符号链接、大小写及 Unicode 规范化等路径别名按实际目录关系检查。首次备份前核对完整配置中的目录关系，包括执行顺序靠后或不存在的源目录。
 - `keep`：至少为 1 的整数，不接受布尔值或字符串。本阶段即使超过此值也保留所有历史包。
 
 运行一次：
@@ -56,7 +62,24 @@ cp config.example.json config.json
 python3 backup.py --config /绝对路径/config.json
 ```
 
-`--config` 也可使用相对于当前工作目录的路径。终端会输出备份项的开始、结果和成功备份包的完整位置；成功退出码为 `0`，失败为非零。错误输出在标准错误流中，包含原因和已识别的备份项名称。
+`--config` 也可使用相对于当前工作目录的路径。终端会输出每项的开始、结果和成功备份包的完整位置，最后按配置顺序汇总全部项目。全部成功退出码为 `0`，任一项失败为 `1`。即时错误输出在标准错误流中，包含原因和备份项名称；最终汇总在标准输出中重列各项结果。
+
+无法解析 JSON、字段结构不合法、名称重复或保留份数不合法，会在执行任何备份前报错退出。可归属到某项的目录关系、目录访问、压缩或发布问题，作为该项失败处理，其他合法项目仍按顺序执行。失败项不发布正式成功包，也不删除任何已有包。例如中间项失败时：
+
+```text
+[documents] 开始备份：/Users/backup/Documents
+[documents] 备份成功：/Volumes/Backup/archives/backup-v1--documents--….zip
+[missing] 开始备份：/Users/backup/Missing
+[missing] 备份失败：源目录不可访问 /Users/backup/Missing：…
+[projects] 开始备份：/Users/backup/Projects
+[projects] 备份成功：/Volumes/Backup/archives/backup-v1--projects--….zip
+汇总：存在失败
+[documents] 备份成功：/Volumes/Backup/archives/backup-v1--documents--….zip
+[missing] 备份失败：源目录不可访问 /Users/backup/Missing：…
+[projects] 备份成功：/Volumes/Backup/archives/backup-v1--projects--….zip
+```
+
+上例省略了备份包的时间戳、随机标识及系统错误详情，整次运行退出码为 `1`。共用备份目录时，包名中的 `name` 区分各项归属；即使某项超过自己的 `keep`，本版本仍保留全部历史包。
 
 备份包名称格式为：
 
@@ -66,7 +89,7 @@ backup-v1--<name>--<UTC时间戳 YYYYMMDDTHHMMSS.ffffffZ>--<32位随机标识>.z
 
 前缀标识本程序的命名版本，名称标识备份项归属，时间戳和随机标识区分每次运行。解析时从右侧识别时间戳和随机标识，名称本身允许包含 `--`。本版本不会删除或覆盖已有备份包及其他文件。
 
-压缩过程使用备份目录中的私有临时子目录。系统 zip 完整写入并成功关闭后，程序通过 macOS `renamex_np(RENAME_EXCL)` 原子发布正式 ZIP；已有同名文件不会被覆盖，也不依赖硬链接。读取、压缩或发布失败会非零退出，尽力清理本次临时产物。如果卷不支持排他重命名，发布会明确失败。强制杀进程或断电可能留下 `.backup-service-*` 临时目录，它们不属于正式备份；确认没有程序运行后可人工移除。
+压缩过程使用备份目录中的私有临时子目录。系统 zip 完整写入并成功关闭后，程序通过 macOS `renamex_np(RENAME_EXCL)` 原子发布正式 ZIP；已有同名文件不会被覆盖，也不依赖硬链接。读取、压缩或发布失败会记录该项失败，尽力清理本次临时产物，继续后续项，最终非零退出。如果卷不支持排他重命名，发布会明确失败。强制杀进程或断电可能留下 `.backup-service-*` 临时目录，它们不属于正式备份；确认没有程序运行后可人工移除。
 
 ## 在 macOS 上恢复
 
@@ -100,7 +123,7 @@ test "$(readlink "$restore/Documents/notes-link")" = './notes.txt'
 python3 -m unittest discover -s tests -v
 ```
 
-测试通过真实 CLI 和独立的系统 unzip 验证恢复，覆盖配置错误、连续运行、路径别名、各类符号链接、FIFO/Unix socket、权限错误、写入失败和正式发布失败。全部文件均放在隔离临时目录。工具不可用和发布失败场景使用 macOS `/usr/bin/sandbox-exec`；测试环境需允许创建 Unix socket 和启动该隔离子进程。root 用户会跳过两个依赖普通用户权限的测试。
+测试通过真实 CLI、独立读取 ZIP 及系统 unzip 验证恢复，覆盖多项顺序执行、共用备份目录、中间项失败后继续、全局配置拒绝、跨项目录关系和最终汇总，同时保留单项归档、连续运行、路径别名、各类符号链接、FIFO/Unix socket、权限错误、写入失败和正式发布失败的验证。全部文件均放在隔离临时目录。工具不可用和发布失败场景使用 macOS `/usr/bin/sandbox-exec`；测试环境需允许创建 Unix socket 和启动该隔离子进程。root 用户会跳过依赖普通用户权限的测试。
 
 开发时可选安装 mypy，执行 `mypy --strict backup.py tests`；它仅用于开发检查，不是运行依赖。本次验证使用 macOS 26.6.2、Python 3.14.6、系统 zip 3.0 / unzip 6.00，并使用系统 Python 3.9.6 验证了目录和链接恢复。
 

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from typing import Callable, Optional
 
 
@@ -35,7 +36,7 @@ class BackupCLITests(unittest.TestCase):
         self.write_config({"backups": [self.item]})
 
     def write_config(self, config: object) -> None:
-        self.config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        self.config.write_text(json.dumps(config), encoding="utf-8")
 
     def run_backup(
         self,
@@ -103,13 +104,50 @@ class BackupCLITests(unittest.TestCase):
             set(files) | {"多层", "多层/子目录", "空目录", ".隐藏目录"},
         )
 
+    def multiple_items(self) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for index, name in enumerate(["z-first", "middle", "a-last"]):
+            source = self.root / name
+            source.mkdir()
+            (source / "content.txt").write_text(name, encoding="utf-8")
+            items.append({**self.item, "name": name, "source": str(source), "keep": index + 1})
+        return items
+
+    def test_multiple_backups_run_in_order_and_share_a_destination_without_cleanup(self) -> None:
+        items = self.multiple_items()
+        self.write_config({"backups": items})
+        previous: dict[Path, bytes] = {}
+        for _ in range(2):
+            result = self.run_backup()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            events = [line for line in result.stdout.split("汇总", 1)[0].splitlines() if "开始备份" in line or "备份成功" in line]
+            self.assertEqual(len(events), 6, result.stdout)
+            for index, name in enumerate(["z-first", "middle", "a-last"]):
+                self.assertIn(f"[{name}] 开始备份", events[index * 2])
+                self.assertIn(f"[{name}] 备份成功", events[index * 2 + 1])
+            summary = result.stdout.split("汇总", 1)[1]
+            self.assertIn("全部成功", summary)
+            for name in ["z-first", "middle", "a-last"]:
+                self.assertIn(f"[{name}]", summary)
+            for path, content in previous.items():
+                self.assertEqual(path.read_bytes(), content)
+            new_paths = set(self.destination.iterdir()) - previous.keys()
+            self.assertEqual(len(new_paths), 3)
+            for name in ["z-first", "middle", "a-last"]:
+                archive = next(path for path in new_paths if f"--{name}--" in path.name)
+                self.assertIn(str(archive), summary)
+                with zipfile.ZipFile(archive) as backup:
+                    self.assertEqual(backup.namelist(), [f"{name}/", f"{name}/content.txt"])
+                    self.assertEqual(backup.read(f"{name}/content.txt"), name.encode())
+            previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+
     def test_invalid_configuration_fails_before_creating_a_backup(self) -> None:
         cases: list[tuple[object, str]] = [
             ([], "JSON 对象"),
             ({}, "backups"),
             ({"backups": {}}, "backups"),
             ({"backups": []}, "一个备份项"),
-            ({"backups": [self.item, self.item]}, "尚未支持多个备份项"),
+            ({"backups": [self.item, self.item]}, "名称重复"),
             ({"backups": ["wrong"]}, "备份项"),
         ]
         for field in self.item:
@@ -131,6 +169,183 @@ class BackupCLITests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertFalse(self.destination.exists())
+
+    def test_invalid_later_item_prevents_every_backup(self) -> None:
+        for invalid, reason in [
+            (self.item, "名称重复"),
+            ("wrong", "备份项"),
+            ({**self.item, "name": "second", "keep": True}, "keep"),
+            ({**self.item, "name": "second", "source": "relative"}, "source"),
+            ({**self.item, "name": "second", "destination": None}, "destination"),
+            ({**self.item, "name": "second", "source": "/tmp/\ud800"}, "source"),
+        ]:
+            with self.subTest(invalid=invalid):
+                self.write_config({"backups": [self.item, invalid]})
+                result = self.run_backup()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("开始备份", result.stdout)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.destination.exists())
+
+    def test_cross_item_destinations_are_rejected_before_any_archive_is_written(self) -> None:
+        items = self.multiple_items()
+        other_source = self.root / "middle"
+        alias = self.root / "middle-alias"
+        alias.symlink_to(other_source, target_is_directory=True)
+        cases = [other_source, other_source / "new/backups", alias, alias / "new/backups"]
+        for index, destination in enumerate(cases):
+            with self.subTest(destination=destination):
+                items[0]["destination"] = str(destination)
+                safe_destination = self.root / f"safe-{index}"
+                items[1]["destination"] = str(safe_destination)
+                self.write_config({"backups": items})
+                result = self.run_backup()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("[z-first]", result.stderr)
+                self.assertIn("备份目录不能等于源目录或位于其内部", result.stderr)
+                self.assertIn("middle", result.stderr)
+                self.assertEqual(list(other_source.iterdir()), [other_source / "content.txt"])
+                archive = next(safe_destination.glob("*.zip"))
+                with zipfile.ZipFile(archive) as backup:
+                    self.assertEqual(set(backup.namelist()), {"middle/", "middle/content.txt"})
+                summary = result.stdout.split("汇总", 1)[1]
+                self.assertIn("[z-first] 备份失败", summary)
+                self.assertIn("[middle] 备份成功", summary)
+                self.assertIn("[a-last] 备份成功", summary)
+
+    def assert_middle_failure_preserves_history_and_continues(
+        self, result: subprocess.CompletedProcess[str], previous: dict[Path, bytes]
+    ) -> None:
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[middle] 备份失败", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        summary = result.stdout.split("汇总", 1)[1]
+        self.assertIn("[z-first] 备份成功", summary)
+        self.assertIn("[middle] 备份失败", summary)
+        self.assertIn("[a-last] 备份成功", summary)
+        for path, content in previous.items():
+            self.assertEqual(path.read_bytes(), content)
+        new_paths = set(self.destination.iterdir()) - previous.keys()
+        self.assertEqual(len(new_paths), 2, new_paths)
+        for name in ["z-first", "a-last"]:
+            archive = next(path for path in new_paths if f"--{name}--" in path.name)
+            with zipfile.ZipFile(archive) as backup:
+                self.assertEqual(backup.read(f"{name}/content.txt"), name.encode())
+
+    def test_middle_directory_errors_do_not_stop_later_items(self) -> None:
+        items = self.multiple_items()
+        self.write_config({"backups": items})
+        self.assertEqual(self.run_backup().returncode, 0)
+        plain_file = self.root / "plain-file"
+        plain_file.write_bytes(b"untouched")
+        loop = self.root / "loop"
+        loop.symlink_to(loop)
+        for field, path in [
+            ("source", self.root / "missing"),
+            ("source", plain_file),
+            ("destination", plain_file),
+            ("source", loop),
+            ("destination", loop),
+        ]:
+            with self.subTest(field=field, path=path):
+                previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+                self.write_config({"backups": [items[0], {**items[1], field: str(path)}, items[2]]})
+                result = self.run_backup()
+                self.assert_middle_failure_preserves_history_and_continues(result, previous)
+                self.assertIn(str(path), result.stderr)
+                self.assertEqual(plain_file.read_bytes(), b"untouched")
+
+    @unittest.skipIf(os.geteuid() == 0, "权限失败场景需要非 root 用户")
+    def test_middle_permission_errors_do_not_stop_later_items(self) -> None:
+        items = self.multiple_items()
+        parent = self.root / "private-parent"
+        parent.mkdir()
+        source = parent / "middle"
+        (self.root / "middle").rename(source)
+        items[1]["source"] = str(source)
+        destination = self.root / "private-destination"
+        destination.mkdir()
+        self.write_config({"backups": items})
+        self.assertEqual(self.run_backup().returncode, 0)
+        for inaccessible in [parent, source, source / "content.txt", destination]:
+            with self.subTest(inaccessible=inaccessible):
+                middle = items[1].copy()
+                if inaccessible == destination:
+                    middle["destination"] = str(destination)
+                self.write_config({"backups": [items[0], middle, items[2]]})
+                previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+                mode = inaccessible.stat().st_mode
+                try:
+                    inaccessible.chmod(0)
+                    result = self.run_backup()
+                finally:
+                    inaccessible.chmod(mode)
+                self.assert_middle_failure_preserves_history_and_continues(result, previous)
+                if inaccessible == source / "content.txt":
+                    self.assertIn("zip 压缩失败", result.stderr)
+
+    def test_middle_archive_write_failure_does_not_stop_later_items(self) -> None:
+        items = self.multiple_items()
+        self.write_config({"backups": items})
+        self.assertEqual(self.run_backup().returncode, 0)
+        previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+        (self.root / "middle/content.txt").write_bytes(os.urandom(128 * 1024))
+
+        def limit_file_size() -> None:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+
+        result = self.run_backup(preexec_fn=limit_file_size)
+
+        self.assert_middle_failure_preserves_history_and_continues(result, previous)
+        self.assertIn("zip 压缩失败", result.stderr)
+
+    def test_missing_source_still_prevents_other_items_writing_inside_it(self) -> None:
+        items = self.multiple_items()
+        missing = self.root / "missing"
+        alias = self.root / "missing-alias"
+        alias.symlink_to(missing, target_is_directory=True)
+        items[0]["destination"] = str(alias / "backups")
+        items[1]["source"] = str(missing)
+        self.write_config({"backups": items})
+
+        result = self.run_backup()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(missing.exists())
+        summary = result.stdout.split("汇总", 1)[1]
+        self.assertIn("[z-first] 备份失败", summary)
+        self.assertIn("[middle] 备份失败", summary)
+        self.assertIn("[a-last] 备份成功", summary)
+
+    def test_missing_source_is_protected_through_case_and_unicode_aliases(self) -> None:
+        items = self.multiple_items()
+        parent = self.root / "Parent-é"
+        parent.mkdir()
+        aliases = [self.root / "parent-é", self.root / "Parent-e\u0301"]
+        if not all(alias.exists() for alias in aliases):
+            self.skipTest("临时目录所在卷需要支持大小写和 Unicode 规范化别名")
+        for index, (source, destination) in enumerate([
+            (parent / "missing", aliases[0] / "missing/archives"),
+            (parent / "missing", aliases[1] / "missing/archives"),
+            (parent / "Missing", parent / "missing/archives"),
+            (parent / "é", parent / "e\u0301/archives"),
+        ]):
+            with self.subTest(source=source, destination=destination):
+                safe_destination = self.root / f"safe-alias-{index}"
+                self.write_config({"backups": [
+                    {**items[0], "destination": str(destination)},
+                    {**items[1], "source": str(source)},
+                    {**items[2], "destination": str(safe_destination)},
+                ]})
+                result = self.run_backup()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(list(parent.iterdir()), [])
+                summary = result.stdout.split("汇总", 1)[1]
+                self.assertIn("[z-first] 备份失败", summary)
+                self.assertIn("[middle] 备份失败", summary)
+                self.assertIn("[a-last] 备份成功", summary)
+                self.assertEqual(len(list(safe_destination.glob("*.zip"))), 1)
 
     def test_links_are_restored_without_traversing_their_targets(self) -> None:
         (self.source / "file.txt").write_bytes(b"inside")
