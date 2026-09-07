@@ -302,7 +302,7 @@ def run_command(lock_descriptor: int) -> int:
             result = f"[{item.name}] 备份失败：{error}"
             print(result, file=sys.stderr, flush=True)
             failures += 1
-        else:
+        else:  #没有异常，不进入 except 块，则执行 else 块
             try:
                 prune_backups(item, archive)
             except (OSError, ValueError) as error:
