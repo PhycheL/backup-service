@@ -1,0 +1,57 @@
+{
+  "tracker": "github",
+  "repository": "PhycheL/backup-service",
+  "parent": "https://github.com/PhycheL/backup-service/issues/1",
+  "status": "published",
+  "label": "ready-for-agent",
+  "native_dependencies_verified": true,
+  "parent_unchanged": true,
+  "tickets": [
+    {
+      "sequence": 1,
+      "number": 2,
+      "id": 5373379865,
+      "title": "单个备份项完成一次 ZIP 备份",
+      "url": "https://github.com/PhycheL/backup-service/issues/2",
+      "file": "01-single-backup.md",
+      "blocked_by": [],
+      "body_matches": true
+    },
+    {
+      "sequence": 2,
+      "number": 3,
+      "id": 5373385746,
+      "title": "多备份项顺序执行与失败汇总",
+      "url": "https://github.com/PhycheL/backup-service/issues/3",
+      "file": "02-multiple-backups.md",
+      "blocked_by": [
+        2
+      ],
+      "body_matches": true
+    },
+    {
+      "sequence": 3,
+      "number": 4,
+      "id": 5373403654,
+      "title": "按备份项保留最近的备份包",
+      "url": "https://github.com/PhycheL/backup-service/issues/4",
+      "file": "03-retention.md",
+      "blocked_by": [
+        3
+      ],
+      "body_matches": true
+    },
+    {
+      "sequence": 4,
+      "number": 5,
+      "id": 5373405277,
+      "title": "拒绝重复启动并自动释放运行锁",
+      "url": "https://github.com/PhycheL/backup-service/issues/5",
+      "file": "04-single-instance.md",
+      "blocked_by": [
+        2
+      ],
+      "body_matches": true
+    }
+  ]
+}
