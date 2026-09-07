@@ -73,6 +73,14 @@ class BackupCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return destination / self.source.name
 
+    def create_excess_history(self) -> dict[Path, bytes]:
+        self.write_config({"backups": [{**self.item, "keep": 10}]})
+        for _ in range(3):
+            result = self.run_backup()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.write_config({"backups": [self.item]})
+        return {path: path.read_bytes() for path in self.destination.iterdir()}
+
     def test_complete_directory_can_be_restored(self) -> None:
         (self.source / "多层" / "子目录").mkdir(parents=True)
         (self.source / "空目录").mkdir()
@@ -113,11 +121,12 @@ class BackupCLITests(unittest.TestCase):
             items.append({**self.item, "name": name, "source": str(source), "keep": index + 1})
         return items
 
-    def test_multiple_backups_run_in_order_and_share_a_destination_without_cleanup(self) -> None:
+    def test_multiple_backups_run_in_order_and_keep_independent_recent_archives(self) -> None:
         items = self.multiple_items()
         self.write_config({"backups": items})
         previous: dict[Path, bytes] = {}
-        for _ in range(2):
+        histories: dict[str, list[Path]] = {str(item["name"]): [] for item in items}
+        for _ in range(4):
             result = self.run_backup()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             events = [line for line in result.stdout.split("汇总", 1)[0].splitlines() if "开始备份" in line or "备份成功" in line]
@@ -129,8 +138,6 @@ class BackupCLITests(unittest.TestCase):
             self.assertIn("全部成功", summary)
             for name in ["z-first", "middle", "a-last"]:
                 self.assertIn(f"[{name}]", summary)
-            for path, content in previous.items():
-                self.assertEqual(path.read_bytes(), content)
             new_paths = set(self.destination.iterdir()) - previous.keys()
             self.assertEqual(len(new_paths), 3)
             for name in ["z-first", "middle", "a-last"]:
@@ -139,6 +146,11 @@ class BackupCLITests(unittest.TestCase):
                 with zipfile.ZipFile(archive) as backup:
                     self.assertEqual(backup.namelist(), [f"{name}/", f"{name}/content.txt"])
                     self.assertEqual(backup.read(f"{name}/content.txt"), name.encode())
+                histories[name].append(archive)
+            expected = set(histories["z-first"][-1:] + histories["middle"][-2:] + histories["a-last"][-3:])
+            self.assertEqual(set(self.destination.iterdir()), expected)
+            for path in expected & previous.keys():
+                self.assertEqual(path.read_bytes(), previous[path])
             previous = {path: path.read_bytes() for path in self.destination.iterdir()}
 
     def test_invalid_configuration_fails_before_creating_a_backup(self) -> None:
@@ -148,6 +160,7 @@ class BackupCLITests(unittest.TestCase):
             ({"backups": {}}, "backups"),
             ({"backups": []}, "一个备份项"),
             ({"backups": [self.item, self.item]}, "名称重复"),
+            ({"backups": [{**self.item, "name": "café"}, {**self.item, "name": "cafe\u0301"}]}, "名称重复"),
             ({"backups": ["wrong"]}, "备份项"),
         ]
         for field in self.item:
@@ -169,6 +182,136 @@ class BackupCLITests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertFalse(self.destination.exists())
+
+    def test_retention_uses_archive_time_and_preserves_unrelated_entries_after_rename(self) -> None:
+        self.write_config({"backups": [{**self.item, "keep": 10}]})
+        history: list[Path] = []
+        for index in range(3):
+            (self.source / "version.txt").write_text(f"version {index}")
+            self.assertEqual(self.run_backup().returncode, 0)
+            archive = (set(self.destination.iterdir()) - set(history)).pop()
+            history.append(archive)
+        # 文件修改时间与创建顺序相反，保留仍应依据包名中的备份时间。
+        for index, archive in enumerate(history):
+            os.utime(archive, (1000 - index, 1000 - index))
+        self.write_config({"backups": [{**self.item, "keep": 2}]})
+        result = self.run_backup()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(history[0].exists())
+        self.assertFalse(history[1].exists())
+        self.assertTrue(history[2].exists())
+        self.assertEqual(len(list(self.destination.iterdir())), 2)
+        old_archives = {path: path.read_bytes() for path in self.destination.iterdir()}
+
+        name = "中文--documents[1]"
+        prefix = f"backup-v1--{name}--"
+        suffix = "--" + "a" * 32 + ".zip"
+        unrelated_names = [
+            "notes.txt", "unknown.zip", "backup-v2--" + name + "--20200101T000000.000000Z" + suffix,
+            prefix + "20201301T000000.000000Z" + suffix,
+            prefix + "20200101T000000.000000Z--unknown.zip",
+            prefix + "20200101T000000.000000Z" + suffix + ".partial",
+            prefix + "20200101T000000.000000Z" + suffix + "\n",
+            "backup-v1--" + name + "-other--20200101T000000.000000Z" + suffix,
+        ]
+        for filename in unrelated_names:
+            (self.destination / filename).write_bytes(b"unrelated content")
+        directory = self.destination / (prefix + "20200102T000000.000000Z" + suffix)
+        directory.mkdir()
+        (directory / "keep.txt").write_bytes(b"directory content")
+        temporary = self.destination / ".backup-service-unfinished"
+        temporary.mkdir()
+        (temporary / "archive.zip").write_bytes(b"unfinished")
+        link = self.destination / (prefix + "20200103T000000.000000Z" + suffix)
+        link.symlink_to(history[2])
+        dangling = self.destination / (prefix + "20200104T000000.000000Z" + suffix)
+        dangling.symlink_to("missing")
+        protected = set(self.destination.iterdir())
+        self.write_config({"backups": [{**self.item, "name": name}]})
+        first_new = None
+        for _ in range(2):
+            result = self.run_backup()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            new_paths = set(self.destination.iterdir()) - protected
+            self.assertEqual(len(new_paths), 1)
+            if first_new is not None:
+                self.assertFalse(first_new.exists())
+            first_new = new_paths.pop()
+            self.assertEqual(set(self.destination.iterdir()), protected | {first_new})
+            for path, content in old_archives.items():
+                self.assertEqual(path.read_bytes(), content)
+            for filename in unrelated_names:
+                self.assertEqual((self.destination / filename).read_bytes(), b"unrelated content")
+            self.assertEqual((directory / "keep.txt").read_bytes(), b"directory content")
+            self.assertEqual((temporary / "archive.zip").read_bytes(), b"unfinished")
+            self.assertEqual(os.readlink(link), str(history[2]))
+            self.assertEqual(os.readlink(dangling), "missing")
+
+    def test_cleanup_failure_keeps_new_archive_and_continues_later_items(self) -> None:
+        items = self.multiple_items()
+        self.write_config({"backups": [{**item, "keep": 10} for item in items]})
+        history = []
+        for _ in range(3):
+            self.assertEqual(self.run_backup().returncode, 0)
+            history.append(next(path for path in self.destination.glob("*--middle--*.zip") if path not in history))
+        previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+        self.write_config({"backups": [{**item, "keep": 1} for item in items]})
+        # 允许压缩与发布，只禁止删除第二旧的 middle 包，观察淘汰顺序。
+        profile = f'(version 1)(allow default)(deny file-write-unlink (literal {json.dumps(str(history[1]), ensure_ascii=False)}))'
+
+        result = self.run_backup(prefix=("/usr/bin/sandbox-exec", "-p", profile))
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[middle] 新包已成功", result.stderr)
+        self.assertIn("旧包清理失败", result.stderr)
+        self.assertIn(str(history[1]), result.stderr)
+        self.assertNotIn("[middle] 备份失败", result.stdout + result.stderr)
+        self.assertNotIn("[middle] 备份成功", result.stdout)
+        summary = result.stdout.split("汇总", 1)[1]
+        self.assertIn("存在失败", summary)
+        self.assertIn("[middle] 新包已成功", summary)
+        self.assertIn("旧包清理失败", summary)
+        self.assertIn("[z-first] 备份成功", summary)
+        self.assertIn("[a-last] 备份成功", summary)
+        self.assertFalse(history[0].exists())
+        for path in history[1:]:
+            self.assertEqual(path.read_bytes(), previous[path])
+        new_paths = set(self.destination.iterdir()) - previous.keys()
+        self.assertEqual(len(new_paths), 3)
+        for name in ["z-first", "middle", "a-last"]:
+            archive = next(path for path in new_paths if f"--{name}--" in path.name)
+            self.assertIn(str(archive), summary)
+            with zipfile.ZipFile(archive) as backup:
+                self.assertEqual(backup.read(f"{name}/content.txt"), name.encode())
+        self.assertEqual(set(self.destination.iterdir()), new_paths | set(history[1:]))
+        # 故障解除后再次运行即可完成保留处理。
+        result = self.run_backup()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(list(self.destination.iterdir())), 3)
+
+    def test_current_archive_is_kept_even_when_history_has_a_future_timestamp(self) -> None:
+        previous = self.create_excess_history()
+        oldest = sorted(previous)[0]
+        prefix, _, suffix = oldest.name.rsplit("--", 2)
+        future = oldest.with_name(prefix + "--29990101T000000.000000Z--" + suffix)
+        oldest.rename(future)
+        future_content = future.read_bytes()
+        self.write_config({"backups": [{**self.item, "keep": 2}]})
+
+        result = self.run_backup()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(future.read_bytes(), future_content)
+        current = (set(self.destination.iterdir()) - {future}).pop()
+        self.assertNotIn(current, previous)
+        self.assertIn(str(current), result.stdout)
+        self.assertEqual(set(self.destination.iterdir()), {future, current})
+        self.write_config({"backups": [self.item]})
+        result = self.run_backup()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(future.exists())
+        self.assertFalse(current.exists())
+        self.assertEqual(len(list(self.destination.iterdir())), 1)
 
     def test_invalid_later_item_prevents_every_backup(self) -> None:
         for invalid, reason in [
@@ -225,7 +368,8 @@ class BackupCLITests(unittest.TestCase):
         self.assertIn("[middle] 备份失败", summary)
         self.assertIn("[a-last] 备份成功", summary)
         for path, content in previous.items():
-            self.assertEqual(path.read_bytes(), content)
+            if "--middle--" in path.name:
+                self.assertEqual(path.read_bytes(), content)
         new_paths = set(self.destination.iterdir()) - previous.keys()
         self.assertEqual(len(new_paths), 2, new_paths)
         for name in ["z-first", "a-last"]:
@@ -387,7 +531,7 @@ class BackupCLITests(unittest.TestCase):
         (self.destination / "other.zip").write_bytes(b"not our archive")
         previous = {path: path.read_bytes() for path in self.destination.iterdir()}
         for index, name in enumerate(["documents", "documents", "中文 名称--documents"]):
-            self.write_config({"backups": [{**self.item, "name": name}]})
+            self.write_config({"backups": [{**self.item, "name": name, "keep": 10}]})
             content = f"version {index}".encode()
             (self.source / "version.txt").write_bytes(content)
 
@@ -480,9 +624,7 @@ class BackupCLITests(unittest.TestCase):
         file.write_bytes(b"previous content")
         child = self.source / "private-directory"
         child.mkdir()
-        result = self.run_backup()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+        previous = self.create_excess_history()
         for inaccessible in [self.source, child, file]:
             with self.subTest(path=inaccessible):
                 original_mode = inaccessible.stat().st_mode
@@ -500,9 +642,7 @@ class BackupCLITests(unittest.TestCase):
     def test_write_failure_removes_partial_output_and_preserves_existing_backups(self) -> None:
         file = self.source / "data.bin"
         file.write_bytes(b"original")
-        result = self.run_backup()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+        previous = self.create_excess_history()
         file.write_bytes(os.urandom(128 * 1024))
 
         def limit_file_size() -> None:
@@ -600,9 +740,7 @@ class BackupCLITests(unittest.TestCase):
 
     def test_publication_failure_preserves_old_archives_and_cleans_temporary_output(self) -> None:
         (self.source / "file.txt").write_bytes(b"original")
-        result = self.run_backup()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        previous = {path: path.read_bytes() for path in self.destination.iterdir()}
+        previous = self.create_excess_history()
         # 允许写临时产物，但禁止创建正式名称，模拟发布时权限或文件系统错误。
         pattern = "^" + re.escape(str(self.destination)) + "/backup-v1--"
         profile = f'(version 1)(allow default)(deny file-write* (regex {json.dumps(pattern, ensure_ascii=False)}))'

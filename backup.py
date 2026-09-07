@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -57,9 +58,10 @@ def load_config(path: Path) -> list[BackupItem]:
             or len(name.encode("utf-8")) > 100
         ):
             raise BackupError(f"第 {index} 个备份项的 name 必须是 1–100 个 UTF-8 字节的名称，不能含路径分隔符、控制字符或首尾空白")
-        if name in names:
+        normalized_name = unicodedata.normalize("NFC", name)
+        if normalized_name in names:
             raise BackupError(f"备份项名称重复：{name}")
-        names.add(name)
+        names.add(normalized_name)
         keep = item.get("keep")
         if type(keep) is not int or keep < 1:
             raise BackupError(f"[{name}] keep（保留份数）必须是至少为 1 的整数，不能是布尔值")
@@ -125,6 +127,32 @@ def publish_archive(temporary_archive: Path, archive: Path) -> None:
     if rename_exclusive(os.fsencode(temporary_archive), os.fsencode(archive), rename_excl) != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, f"无法发布备份包：{os.strerror(error_number)}", str(archive))
+
+
+def prune_backups(item: BackupItem, archive: Path) -> None:
+    """仅清理当前归属的正式普通文件；本次新包始终占用一个保留名额。"""
+    pattern = re.compile(
+        r"backup-v1--(.+)--([0-9]{8}T[0-9]{6}\.[0-9]{6}Z)--[0-9a-f]{32}\.zip"
+    )
+    name = unicodedata.normalize("NFC", item.name)
+    current_name = unicodedata.normalize("NFC", archive.name)
+    history = []
+    with os.scandir(archive.parent) as entries:
+        for entry in entries:
+            filename = unicodedata.normalize("NFC", entry.name)
+            match = pattern.fullmatch(filename)
+            if filename == current_name or match is None or match[1] != name:
+                continue
+            try:
+                timestamp = datetime.strptime(match[2], "%Y%m%dT%H%M%S.%fZ")
+            except ValueError:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                history.append((timestamp, entry.name, Path(entry.path)))
+    # 同一时间戳时用完整文件名稳定排序，不用可被复制或编辑改变的 mtime。
+    history.sort()
+    for _, _, path in history[:max(0, len(history) - (item.keep - 1))]:
+        path.unlink()
 
 
 def directory_identity(path: Path) -> tuple[int, int, tuple[str, ...]]:
@@ -237,8 +265,15 @@ def main() -> int:
             print(result, file=sys.stderr, flush=True)
             failures += 1
         else:
-            result = f"[{item.name}] 备份成功：{archive}"
-            print(result, flush=True)
+            try:
+                prune_backups(item, archive)
+            except (OSError, ValueError) as error:
+                result = f"[{item.name}] 新包已成功：{archive}；旧包清理失败：{error}"
+                print(result, file=sys.stderr, flush=True)
+                failures += 1
+            else:
+                result = f"[{item.name}] 备份成功：{archive}；旧包清理完成"
+                print(result, flush=True)
         results.append(result)
 
     print("汇总：" + ("存在失败" if failures else "全部成功"), flush=True)
