@@ -37,3 +37,12 @@ go.work.sum
 .cursor/
 .codex/
 scripts/pi-ralph/
+
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.venv/
+
+# Local deployment configuration
+config.json

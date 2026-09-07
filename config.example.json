@@ -1,0 +1,10 @@
+{
+  "backups": [
+    {
+      "name": "documents",
+      "source": "/Users/backup/Documents",
+      "destination": "/Volumes/Backup/archives",
+      "keep": 10
+    }
+  ]
+}
